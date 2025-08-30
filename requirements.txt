@@ -1,0 +1,15 @@
+opencv-python
+numpy
+PyQt5
+pandas
+requests
+ultralytics
+deep-sort-realtime
+face-recognition
+dlib
+pyttsx3
+sqlalchemy
+flask
+jinja2
+reportlab
+boto3
