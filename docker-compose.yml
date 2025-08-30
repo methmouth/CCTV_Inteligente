@@ -1,0 +1,32 @@
+version: "3.9"
+services:
+  cctv-app:
+    build: .
+    container_name: cctv_app
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    devices:
+      - "/dev/video0:/dev/video0"
+    volumes:
+      - ./recordings:/app/recordings
+      - ./evidencias:/app/evidencias
+      - ./reports:/app/reports
+      - ./people.db:/app/people.db
+      - ./config_history:/app/config_history
+    environment:
+      - TZ=UTC
+    command: python app.py
+
+  cctv-reporter:
+    build: .
+    container_name: cctv_reporter
+    restart: unless-stopped
+    depends_on:
+      - cctv-app
+    volumes:
+      - ./reports:/app/reports
+      - ./people.db:/app/people.db
+    environment:
+      - TZ=UTC
+    entrypoint: ["bash","-c","while true; do python reporter.py; sleep 28800; done"]
