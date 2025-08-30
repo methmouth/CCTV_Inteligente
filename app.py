@@ -1,148 +1,195 @@
-import sys, os, cv2, time, json, sqlite3, subprocess
+import sys, os, cv2, time, json, sqlite3, threading, subprocess
 import numpy as np
 import pyttsx3
-from PyQt5.QtWidgets import QApplication, QMainWindow, QLabel, QVBoxLayout, QWidget, QAction, QFileDialog, QToolBar, QTableWidget, QTableWidgetItem, QPushButton, QHBoxLayout, QMessageBox
-from PyQt5.QtGui import QImage, QPixmap
-from PyQt5.QtCore import QTimer
+import face_recognition
 from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
+from PyQt5 import QtWidgets, QtCore, QtGui
+import pandas as pd
+from flask import Flask, jsonify, request
 
+# --------------------
+# Configuración global
+# --------------------
 DB_PATH = "people.db"
 CAMERA_CONFIG = "cameras.json"
+UPLOAD_ENABLED = False  # activar si quieres rclone/boto3
+ALERT_COOLDOWN = 10     # seg entre alertas de un desconocido
 
-class CCTVApp(QMainWindow):
+# --------------------
+# Detector YOLOv8 + tracker
+# --------------------
+model = YOLO("yolov8n.pt")
+tracker = DeepSort(max_age=30)
+
+# --------------------
+# Text-to-Speech
+# --------------------
+engine = pyttsx3.init()
+engine.setProperty("rate", 170)
+
+def speak_alert(msg):
+    engine.say(msg)
+    engine.runAndWait()
+
+# --------------------
+# Reconocimiento facial
+# --------------------
+def load_known_faces():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, name, role, face_path FROM persons WHERE face_path IS NOT NULL")
+    rows = c.fetchall()
+    conn.close()
+
+    known_encodings, known_meta = [], []
+    for pid, name, role, face_path in rows:
+        if os.path.exists(face_path):
+            img = face_recognition.load_image_file(face_path)
+            encs = face_recognition.face_encodings(img)
+            if encs:
+                known_encodings.append(encs[0])
+                known_meta.append((pid, name, role))
+    return known_encodings, known_meta
+
+known_encodings, known_meta = load_known_faces()
+
+def identify_face(frame, box):
+    # box formato xyxy
+    x1, y1, x2, y2 = [int(v) for v in box]
+    face_img = frame[y1:y2, x1:x2]
+    rgb = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
+    encs = face_recognition.face_encodings(rgb)
+    if encs:
+        matches = face_recognition.compare_faces(known_encodings, encs[0], tolerance=0.45)
+        if True in matches:
+            idx = matches.index(True)
+            return known_meta[idx][1]  # nombre
+    return "Desconocido"
+
+# --------------------
+# DB utils
+# --------------------
+def log_event(camera_id, person_name, role):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO events (timestamp, camera, person, role) VALUES (?,?,?,?)",
+              (time.strftime("%Y-%m-%d %H:%M:%S"), camera_id, person_name, role))
+    conn.commit()
+    conn.close()
+
+# --------------------
+# Cámara Worker
+# --------------------
+class CameraWorker(QtCore.QThread):
+    frame_ready = QtCore.pyqtSignal(np.ndarray)
+
+    def __init__(self, cam_id, url):
+        super().__init__()
+        self.cam_id = cam_id
+        self.url = url
+        self.running = True
+        self.last_alert = 0
+
+    def run(self):
+        cap = cv2.VideoCapture(self.url)
+        while self.running:
+            ret, frame = cap.read()
+            if not ret: break
+
+            # YOLO detecciones
+            results = model(frame)
+            detections = []
+            for r in results:
+                for box, score, cls in zip(r.boxes.xyxy, r.boxes.conf, r.boxes.cls):
+                    if int(cls) == 0 and score > 0.5:  # persona
+                        x1,y1,x2,y2 = map(int, box.tolist())
+                        detections.append([x1,y1,x2,y2,float(score), int(cls)])
+
+            # Tracking
+            tracks = tracker.update_tracks(detections, frame=frame)
+            for t in tracks:
+                if not t.is_confirmed(): continue
+                x1,y1,x2,y2 = map(int, t.to_ltrb())
+                person_name = identify_face(frame, (x1,y1,x2,y2))
+                role = "Desconocido"
+                if person_name != "Desconocido":
+                    role = "Empleado"
+                else:
+                    # alerta sonora con cooldown
+                    if time.time() - self.last_alert > ALERT_COOLDOWN:
+                        threading.Thread(target=speak_alert, args=(f"Alerta: persona desconocida en cámara {self.cam_id}",)).start()
+                        self.last_alert = time.time()
+
+                # Log
+                log_event(self.cam_id, person_name, role)
+
+                # Dibujo hitbox
+                cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2)
+                cv2.putText(frame, f"{person_name} ({role})", (x1,y1-10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+
+            self.frame_ready.emit(frame)
+
+        cap.release()
+
+    def stop(self):
+        self.running = False
+
+# --------------------
+# Dashboard PyQt5
+# --------------------
+class CCTVApp(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("CCTV Inteligente — Dashboard")
-        self.resize(1280, 720)
+        self.setWindowTitle("CCTV Inteligente")
+        self.resize(1200, 800)
 
-        self.model = YOLO("yolov8n.pt")
-        self.tracker = DeepSort(max_age=30)
-        self.tts = pyttsx3.init()
+        self.tabs = QtWidgets.QTabWidget()
+        self.setCentralWidget(self.tabs)
 
-        self.conn = sqlite3.connect(DB_PATH)
-        self.cur = self.conn.cursor()
-
-        # Layout
-        self.label = QLabel("Esperando cámaras...")
-        layout = QVBoxLayout()
-        layout.addWidget(self.label)
-        container = QWidget()
-        container.setLayout(layout)
-        self.setCentralWidget(container)
-
-        # ToolBar
-        toolbar = QToolBar("Herramientas")
-        self.addToolBar(toolbar)
-
-        crud_action = QAction("Personas (CRUD)", self)
-        crud_action.triggered.connect(self.open_persons_editor)
-        toolbar.addAction(crud_action)
-
-        events_action = QAction("Eventos (Excel)", self)
-        events_action.triggered.connect(self.open_events_editor)
-        toolbar.addAction(events_action)
-
-        export_action = QAction("Exportar CSV", self)
-        export_action.triggered.connect(self.export_events_csv)
-        toolbar.addAction(export_action)
-
-        refresh_action = QAction("Refrescar DB", self)
-        refresh_action.triggered.connect(self.reload_db)
-        toolbar.addAction(refresh_action)
-
-        # Cámara
-        self.load_cameras()
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.update_frame)
-        self.timer.start(50)
-
-    def load_cameras(self):
-        with open(CAMERA_CONFIG, "r") as f:
+        # Carga cámaras
+        with open(CAMERA_CONFIG) as f:
             self.cameras = json.load(f)
-        # solo usamos la primera cámara por demo
-        self.cap = cv2.VideoCapture(self.cameras["1"])
 
-    def update_frame(self):
-        ret, frame = self.cap.read()
-        if not ret:
-            return
-        results = self.model(frame)
-        detections = []
-        for r in results:
-            boxes = r.boxes.xyxy.cpu().numpy()
-            scores = r.boxes.conf.cpu().numpy()
-            classes = r.boxes.cls.cpu().numpy()
-            for (x1,y1,x2,y2), sc, cl in zip(boxes, scores, classes):
-                if int(cl) == 0 and sc > 0.5:  # persona
-                    detections.append([x1,y1,x2,y2,sc, int(cl)])
-        tracks = self.tracker.update_tracks(detections, frame=frame)
-        for t in tracks:
-            if not t.is_confirmed(): continue
-            x1,y1,x2,y2 = map(int, t.to_ltrb())
-            tid = t.track_id
-            label = self.get_person_label(tid)
-            cv2.rectangle(frame,(x1,y1),(x2,y2),(0,255,0),2)
-            cv2.putText(frame,label,(x1,y1-10),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,0),2)
-            self.log_event("1", tid, label)
-            if label=="Desconocido":
-                self.tts.say(f"Alerta, persona desconocida en cámara 1")
-                self.tts.runAndWait()
+        for cid, url in self.cameras.items():
+            lbl = QtWidgets.QLabel()
+            lbl.setScaledContents(True)
+            self.tabs.addTab(lbl, f"Cámara {cid}")
+
+            worker = CameraWorker(cid, url)
+            worker.frame_ready.connect(lambda f, l=lbl: self.update_frame(l, f))
+            worker.start()
+
+    def update_frame(self, label, frame):
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h,w,ch = rgb.shape
-        qimg = QImage(rgb.data, w,h, ch*w, QImage.Format_RGB888)
-        self.label.setPixmap(QPixmap.fromImage(qimg))
+        img = QtGui.QImage(rgb.data, w,h,ch*w, QtGui.QImage.Format_RGB888)
+        label.setPixmap(QtGui.QPixmap.fromImage(img))
 
-    def get_person_label(self, track_id):
-        return "Desconocido"  # simplificado, se liga con DB
+# --------------------
+# API Flask para dashboard web
+# --------------------
+app_flask = Flask(__name__)
 
-    def log_event(self, camera_id, track_id, label):
-        ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        self.cur.execute("INSERT INTO events (timestamp,camera_id,person_id,details) VALUES (?,?,?,?)",(ts,camera_id,track_id,label))
-        self.conn.commit()
+@app_flask.route("/api/events")
+def api_events():
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql("SELECT * FROM events ORDER BY id DESC LIMIT 100", conn)
+    conn.close()
+    return df.to_json(orient="records")
 
-    def open_persons_editor(self):
-        self.editor = TableEditor("persons")
-        self.editor.show()
+def run_flask():
+    app_flask.run(host="0.0.0.0", port=5000)
 
-    def open_events_editor(self):
-        self.editor = TableEditor("events")
-        self.editor.show()
+# --------------------
+# Main
+# --------------------
+if __name__ == "__main__":
+    # Levantar Flask en hilo aparte
+    threading.Thread(target=run_flask, daemon=True).start()
 
-    def export_events_csv(self):
-        import pandas as pd
-        df = pd.read_sql("SELECT * FROM events", self.conn)
-        df.to_csv("events.csv", index=False)
-        QMessageBox.information(self,"Exportación","Eventos exportados a events.csv")
-
-    def reload_db(self):
-        self.conn = sqlite3.connect(DB_PATH)
-        self.cur = self.conn.cursor()
-        QMessageBox.information(self,"DB","Conexión recargada")
-
-class TableEditor(QWidget):
-    def __init__(self, table_name):
-        super().__init__()
-        self.setWindowTitle(f"Editor: {table_name}")
-        self.conn = sqlite3.connect(DB_PATH)
-        self.cur = self.conn.cursor()
-        self.table = table_name
-        self.layout = QVBoxLayout()
-        self.setLayout(self.layout)
-        self.load_table()
-
-    def load_table(self):
-        rows = self.cur.execute(f"SELECT * FROM {self.table}").fetchall()
-        cols = [d[0] for d in self.cur.description]
-        table = QTableWidget(len(rows), len(cols))
-        table.setHorizontalHeaderLabels(cols)
-        for i,r in enumerate(rows):
-            for j,v in enumerate(r):
-                table.setItem(i,j,QTableWidgetItem(str(v)))
-        self.layout.addWidget(table)
-
-if __name__=="__main__":
-    app = QApplication(sys.argv)
+    app = QtWidgets.QApplication(sys.argv)
     win = CCTVApp()
     win.show()
     sys.exit(app.exec_())
