@@ -1,34 +1,34 @@
 version: "3.9"
-
 services:
   cctv-app:
     build: .
     container_name: cctv_app
     restart: unless-stopped
+    environment:
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN:-}
+      - TELEGRAM_CHAT=${TELEGRAM_CHAT:-}
+      - TRACKER=${TRACKER:-deepsort}   # set to 'bytetrack' to use ByteTrack (install required)
+      - UPLOAD_METHOD=${UPLOAD_METHOD:-}
+    ports:
+      - "5000:5000"
+    devices:
+      - "/dev/video0:/dev/video0"   # optional
     volumes:
       - ./recordings:/app/recordings
       - ./evidencias:/app/evidencias
       - ./reports:/app/reports
+      - ./people.db:/app/people.db
       - ./config_history:/app/config_history
       - ./faces:/app/faces
-      - ./people.db:/app/people.db
       - ./cameras.json:/app/cameras.json
-    ports:
-      - "5000:5000"   # API Flask
-      - "5900:5900"   # (opcional si usas VNC para PyQt en contenedor)
 
   cctv-reporter:
     build: .
     container_name: cctv_reporter
     restart: unless-stopped
-    command: ["python", "reporter.py"]
+    depends_on:
+      - cctv-app
+    entrypoint: ["bash","-c","while true; do python reporter.py once; sleep 28800; done"]
     volumes:
       - ./reports:/app/reports
       - ./people.db:/app/people.db
-
-volumes:
-  recordings:
-  evidencias:
-  reports:
-  config_history:
-  faces:
