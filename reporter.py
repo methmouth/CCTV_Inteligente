@@ -1,120 +1,78 @@
-import sqlite3, time, os, sys
+import os
+import time
+import sqlite3
 import pandas as pd
+from pathlib import Path
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
 from reportlab.lib.pagesizes import A4
-from reportlab.lib import colors
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
+import matplotlib.pyplot as plt
 from jinja2 import Template
 
-DB_PATH = "people.db"
-REPORTS_DIR = "reports"
-os.makedirs(REPORTS_DIR, exist_ok=True)
+BASE = Path(__file__).parent
+DB = BASE / "people.db"
+OUT = BASE / "reports"
+OUT.mkdir(parents=True, exist_ok=True)
 
-# -------------------------
-# Extraer eventos de la BD
-# -------------------------
-def get_events():
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql("SELECT * FROM events ORDER BY id DESC LIMIT 500", conn)
+def get_events(limit=1000):
+    conn = sqlite3.connect(DB)
+    df = pd.read_sql("SELECT * FROM events ORDER BY id DESC LIMIT ?", conn, params=(limit,))
     conn.close()
     return df
 
-# -------------------------
-# Generar PDF
-# -------------------------
-def generate_pdf(df, filename):
-    doc = SimpleDocTemplate(filename, pagesize=A4)
+def gen_pdf(df, outpath):
+    doc = SimpleDocTemplate(str(outpath), pagesize=A4)
     styles = getSampleStyleSheet()
-    elements = []
-
-    elements.append(Paragraph("📊 Reporte de Eventos CCTV Inteligente", styles['Title']))
-    elements.append(Spacer(1, 12))
-
-    # tabla
-    data = [df.columns.tolist()] + df.values.tolist()
-    table = Table(data, repeatRows=1)
-    table.setStyle(TableStyle([
-        ('BACKGROUND',(0,0),(-1,0),colors.lightgrey),
-        ('TEXTCOLOR',(0,0),(-1,0),colors.black),
-        ('GRID',(0,0),(-1,-1),0.5,colors.grey),
-        ('ALIGN',(0,0),(-1,-1),'CENTER'),
-        ('FONTSIZE',(0,0),(-1,-1),8)
-    ]))
-    elements.append(table)
-
-    doc.build(elements)
-    print(f"✅ PDF generado: {filename}")
-
-# -------------------------
-# Generar HTML interactivo
-# -------------------------
-def generate_html(df, filename):
-    template = Template("""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="utf-8"/>
-        <title>Reporte de Eventos CCTV</title>
-        <link rel="stylesheet" href="https://cdn.datatables.net/1.13.4/css/jquery.dataTables.min.css"/>
-        <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
-        <script src="https://cdn.datatables.net/1.13.4/js/jquery.dataTables.min.js"></script>
-    </head>
-    <body>
-        <h1>📊 Reporte de Eventos CCTV Inteligente</h1>
-        <table id="events" class="display" style="width:100%">
-            <thead>
-                <tr>
-                {% for col in cols %}
-                    <th>{{ col }}</th>
-                {% endfor %}
-                </tr>
-            </thead>
-            <tbody>
-                {% for row in rows %}
-                <tr>
-                    {% for cell in row %}
-                        <td>{{ cell }}</td>
-                    {% endfor %}
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-
-        <script>
-        $(document).ready(function() {
-            $('#events').DataTable();
-        });
-        </script>
-    </body>
-    </html>
-    """)
-    html = template.render(cols=df.columns.tolist(), rows=df.values.tolist())
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(html)
-    print(f"✅ HTML generado: {filename}")
-
-# -------------------------
-# Generar Reporte Completo
-# -------------------------
-def generate_reports():
-    df = get_events()
+    elems = [Paragraph("Reporte CCTV Inteligente", styles['Title']), Spacer(1,12)]
     if df.empty:
-        print("⚠️ No hay eventos registrados todavía.")
-        return
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    pdf_file = os.path.join(REPORTS_DIR, f"report_{ts}.pdf")
-    html_file = os.path.join(REPORTS_DIR, f"report_{ts}.html")
-    generate_pdf(df, pdf_file)
-    generate_html(df, html_file)
-
-# -------------------------
-# Loop (cada 8h)
-# -------------------------
-if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "once":
-        generate_reports()
+        elems.append(Paragraph("No hay eventos", styles['Normal']))
     else:
-        print("⏳ Iniciando reporter automático cada 8h...")
-        while True:
-            generate_reports()
-            time.sleep(8 * 3600)
+        # counts per role
+        counts = df['role'].fillna('Desconocido').value_counts().to_dict()
+        elems.append(Paragraph("Resumen por rol:", styles['Heading2']))
+        for k,v in counts.items():
+            elems.append(Paragraph(f"{k}: {v}", styles['Normal']))
+        elems.append(Spacer(1,8))
+        # save plot
+        plt.figure(figsize=(6,3))
+        pd.Series(counts).plot(kind='bar')
+        plt.tight_layout()
+        tmp_plot = OUT / "plot_tmp.png"
+        plt.savefig(tmp_plot)
+        plt.close()
+        elems.append(Image(str(tmp_plot), width=450, height=200))
+        elems.append(Spacer(1,12))
+        # table (first 50 rows)
+        sample = df.head(50)
+        data = [list(sample.columns)] + sample.values.tolist()
+        table = Table(data)
+        table.setStyle(TableStyle([('GRID',(0,0),(-1,-1),0.5,colors.grey),
+                                   ('BACKGROUND',(0,0),(-1,0),colors.lightgrey)]))
+        elems.append(table)
+    doc.build(elems)
+
+def gen_html(df, outpath):
+    tpl = Template("""
+    <html><head><meta charset="utf-8"><title>Reporte CCTV</title>
+    <link rel="stylesheet" href="https://cdn.datatables.net/1.13.4/css/jquery.dataTables.min.css"/>
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script src="https://cdn.datatables.net/1.13.4/js/jquery.dataTables.min.js"></script>
+    </head><body>
+    <h1>Reporte CCTV</h1>
+    <p>Generado: {{ ts }}</p>
+    {{ table|safe }}
+    <script>$(document).ready(()=>$('#t').DataTable());</script>
+    </body></html>
+    """)
+    html = tpl.render(ts=time.strftime("%Y-%m-%d %H:%M:%S"), table=df.to_html(index=False))
+    outpath.write_text(html, encoding="utf-8")
+
+if __name__ == "__main__":
+    df = get_events()
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    pdfp = OUT / f"report_{ts}.pdf"
+    htmlp = OUT / f"report_{ts}.html"
+    gen_pdf(df, pdfp)
+    gen_html(df, htmlp)
+    print("Reportes generados:", pdfp, htmlp)
