@@ -1,0 +1,15 @@
+[Unit]
+Description=CCTV Inteligente (user cctv)
+After=network.target
+
+[Service]
+Type=simple
+User=cctv
+WorkingDirectory=/opt/CCTV_Inteligente
+Environment="PATH=/opt/CCTV_Inteligente/venv/bin"
+ExecStart=/opt/CCTV_Inteligente/venv/bin/python /opt/CCTV_Inteligente/app.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
