@@ -462,4 +462,67 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         idx = self.persons_combo.currentIndex()
         if idx<0:
-            QtWidgets.QMessageBox.warni
+            QtWidgets.QMessageBox.warning(self,"Persona","Selecciona una persona")
+            return
+        pname = self.persons_combo.itemData(idx)
+        # insert into track_bindings
+        conn = get_db_conn(); conn.execute("INSERT OR REPLACE INTO track_bindings (cam_id,track_id,person_name,expires_at) VALUES (?,?,?,?)",
+                                           (cam, tid, pname, None)); conn.commit(); conn.close()
+        QtWidgets.QMessageBox.information(self,"Vinculado", f"Track {tid} vinculado a {pname}")
+
+    def export_events(self):
+        conn = get_db_conn()
+        df = pd.read_sql("SELECT * FROM events ORDER BY id DESC LIMIT 1000", conn)
+        conn.close()
+        csvf = Path(REPORTS_DIR)/"events_export.csv"
+        df.to_csv(str(csvf), index=False)
+        QtWidgets.QMessageBox.information(self,"Exportado", f"Events exportados a {csvf}")
+
+    def closeEvent(self, event):
+        for w in list(self.workers.values()):
+            try:
+                w.stop()
+            except:
+                pass
+        super().closeEvent(event)
+
+# register face helper (GUI also calls register_face.py)
+def enroll_face_from_frame(name, role, frame):
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    boxes = face_recognition.face_locations(rgb)
+    if not boxes:
+        return False, "No se detectó rostro"
+    enc = face_recognition.face_encodings(rgb, boxes)[0]
+    # save image
+    fname = FACES_DIR / f"{name}_{int(time.time())}.jpg"
+    cv2.imwrite(str(fname), frame)
+    # insert to DB
+    conn = get_db_conn()
+    conn.execute("INSERT OR REPLACE INTO persons (name, role, face_path) VALUES (?,?,?)", (name, role, str(fname)))
+    conn.commit()
+    conn.close()
+    # reload known encs
+    global known_encodings, known_meta
+    known_encodings, known_meta = load_face_db()
+    return True, "Enrolamiento correcto"
+
+# main
+def ensure_db():
+    conn = get_db_conn()
+    # make sure tables exist
+    conn.execute("""CREATE TABLE IF NOT EXISTS persons (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, role TEXT, face_path TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, camera TEXT, track_id TEXT, person_name TEXT, role TEXT, confidence REAL, bbox TEXT, evidence TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS track_bindings (
+                        cam_id TEXT, track_id TEXT, person_name TEXT, bound_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, expires_at TIMESTAMP, PRIMARY KEY(cam_id,track_id))""")
+    conn.commit(); conn.close()
+
+if __name__ == "__main__":
+    ensure_db()
+    app = QtWidgets.QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    # API thread
+    threading.Thread(target=run_api, daemon=True).start()
+    sys.exit(app.exec_())
