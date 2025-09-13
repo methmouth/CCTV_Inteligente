@@ -1,12 +1,10 @@
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-*.db
-*.sqlite3
 venv/
 .env
+people.db
 recordings/
 evidencias/
-config_history/
 reports/
+faces/
+config_history/
